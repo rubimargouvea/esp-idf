@@ -1,0 +1,4 @@
+dependencies:
+  esp-idf-lib/bmp280: "^1.0.7"
+  esp-idf-lib/aht: "^1.0.8"
+  esp-idf-lib/ds18x20: "^1.2.8"
