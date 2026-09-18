@@ -3,6 +3,12 @@
 #include "freertos/task.h"
 #include "esp_log.h"
 #include "driver/gpio.h"
+#include "esp_event.h"
+#include "esp_netif.h"
+#include "esp_wifi.h"
+#include "mqtt_client.h"
+#include "nvs_flash.h"
+#include <string.h>
 
 
 // Inclusão dos cabeçalhos das bibliotecas baixadas
@@ -23,10 +29,116 @@
 #define GPIO_AQUECEDOR 18
 #define GPIO_VENTOINHA 19
 
+#define WIFI_SSID "RAG"
+#define WIFI_PASSWORD "AER101023"
+#define UBIDOTS_TOKEN "BBUS-RgZxBqNhqPJ80lxtNuY3W4Lm7cDQeV"
+#define UBIDOTS_DEVICE "desumidificador"
+#define UBIDOTS_MQTT_URI "mqtt://industrial.api.ubidots.com:1883"
+#define UBIDOTS_TOPIC "/v1.6/devices/" UBIDOTS_DEVICE
+
 static const char *TAG = "DESUMID_RAG";
+static EventGroupHandle_t wifi_event_group;
+static esp_mqtt_client_handle_t mqtt_client;
+static const int WIFI_CONNECTED_BIT = BIT0;
+
+static void wifi_event_handler(void *arg, esp_event_base_t event_base,
+                               int32_t event_id, void *event_data)
+{
+    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
+        esp_wifi_connect();
+    } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        xEventGroupClearBits(wifi_event_group, WIFI_CONNECTED_BIT);
+        esp_wifi_connect();
+        ESP_LOGW(TAG, "Wi-Fi desconectado; tentando novamente");
+    } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+        xEventGroupSetBits(wifi_event_group, WIFI_CONNECTED_BIT);
+        ESP_LOGI(TAG, "Wi-Fi conectado");
+    }
+}
+
+static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
+                               int32_t event_id, void *event_data)
+{
+    if (event_id == MQTT_EVENT_CONNECTED) {
+        ESP_LOGI(TAG, "Conectado ao Ubidots");
+    } else if (event_id == MQTT_EVENT_DISCONNECTED) {
+        ESP_LOGW(TAG, "MQTT desconectado");
+    } else if (event_id == MQTT_EVENT_ERROR) {
+        ESP_LOGE(TAG, "Erro na conexão MQTT");
+    }
+}
+
+static void wifi_init(void)
+{
+    wifi_event_group = xEventGroupCreate();
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+    esp_netif_create_default_wifi_sta();
+
+    wifi_init_config_t wifi_init_cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&wifi_init_cfg));
+    ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID,
+                                                &wifi_event_handler, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP,
+                                                &wifi_event_handler, NULL));
+
+    wifi_config_t sta_config = {
+        .sta = {
+            .ssid = WIFI_SSID,
+            .password = WIFI_PASSWORD,
+            .threshold.authmode = WIFI_AUTH_WPA2_PSK,
+        },
+    };
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &sta_config));
+    ESP_ERROR_CHECK(esp_wifi_start());
+    xEventGroupWaitBits(wifi_event_group, WIFI_CONNECTED_BIT, pdFALSE, pdTRUE,
+                        portMAX_DELAY);
+}
+
+static void mqtt_init(void)
+{
+    const esp_mqtt_client_config_t mqtt_config = {
+        .broker.address.uri = UBIDOTS_MQTT_URI,
+        .credentials.username = UBIDOTS_TOKEN,
+        .credentials.authentication.password = "",
+    };
+
+    mqtt_client = esp_mqtt_client_init(&mqtt_config);
+    ESP_ERROR_CHECK(esp_mqtt_client_register_event(mqtt_client, ESP_EVENT_ANY_ID,
+                                                    mqtt_event_handler, NULL));
+    ESP_ERROR_CHECK(esp_mqtt_client_start(mqtt_client));
+}
+
+static void publish_sensor_data(float aht_temperature, float aht_humidity,
+                                float bmp_temperature, float bmp_pressure,
+                                float ds_heater_temperature, bool heater_on,
+                                bool fan_on)
+{
+    if (mqtt_client == NULL ||
+        strcmp(UBIDOTS_TOKEN, "COLOQUE_SEU_TOKEN_UBIDOTS_AQUI") == 0) {
+        return;
+    }
+
+    char payload[256];
+    snprintf(payload, sizeof(payload),
+             "{\"aht_temperature\":%.2f,\"humidity\":%.2f,"
+             "\"bmp_temperature\":%.2f,\"pressure\":%.2f,"
+             "\"heater_temperature\":%.2f,\"heater\":%d,\"fan\":%d}",
+             aht_temperature, aht_humidity, bmp_temperature, bmp_pressure,
+             ds_heater_temperature, heater_on, fan_on);
+
+    int message_id = esp_mqtt_client_publish(mqtt_client, UBIDOTS_TOPIC,
+                                              payload, 0, 1, 0);
+    ESP_LOGI(TAG, "Dados publicados no Ubidots (id=%d)", message_id);
+}
 
 void app_main(void)
 {
+    ESP_ERROR_CHECK(nvs_flash_init());
+    wifi_init();
+    mqtt_init();
+
      // -------------------------------------------------------------------------
     // 1. CONFIGURAÇÃO DAS SAÍDAS DIGITAIS (Aquecedor e Ventoinha)
     // -------------------------------------------------------------------------
@@ -137,19 +249,27 @@ void app_main(void)
         printf("====================== LEITURA ATUAL ======================\n");
         
         // Tomada de decisão com base nos dados coletados do AHT20
+        bool heater_on;
+        bool fan_on;
         if (res_ds == ESP_OK && ds_heater_temperature >= 50.0) {
             gpio_set_level(GPIO_AQUECEDOR, 0); // Desliga calor imediatamente
             gpio_set_level(GPIO_VENTOINHA, 1); // Mantém ventoinha para resfriamento rápido
+            heater_on = false;
+            fan_on = true;
             printf("[ALERTA]   -> EMERGÊNCIA: Aquecedor superaquecido! Forçando resfriamento.\n");
         }
         else if (aht_humidity > 45.0) {
             gpio_set_level(GPIO_AQUECEDOR, 1);
             gpio_set_level(GPIO_VENTOINHA, 1);
+            heater_on = true;
+            fan_on = true;
             printf("[CONTROLE] -> Umidade acima de 45%%! Atuadores ligados para resfriamento e desumidificação.\n");
         }
         else {
             gpio_set_level(GPIO_AQUECEDOR, 0);
             gpio_set_level(GPIO_VENTOINHA, 0);
+            heater_on = false;
+            fan_on = false;
             printf("[CONTROLE] -> Umidade estável. Atuadores desligados.\n");
         }
           
@@ -158,6 +278,12 @@ void app_main(void)
             // Divide o resultado da pressão por 100 para converter de Pascal (Pa) para Hectopascal (hPa)
             bmp_pressure = bmp_pressure / 100.0;
             printf("[BMP280] -> Temperatura: %.2f °C  |  Pressão: %.2f hPa\n", bmp_temperature, bmp_pressure);
+        }
+
+        if (res_aht == ESP_OK && res_bmp == ESP_OK && res_ds == ESP_OK) {
+            publish_sensor_data(aht_temperature, aht_humidity, bmp_temperature,
+                                bmp_pressure, ds_heater_temperature, heater_on,
+                                fan_on);
         }
 
         printf("===========================================================\n\n");
