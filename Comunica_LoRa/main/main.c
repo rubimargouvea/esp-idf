@@ -19,16 +19,15 @@
 
 /* ----------------------------- Hardware ---------------------------------- */
 /* Barramento SPI utilizado pelo transceptor SX1276. */
-#define LORA_SCK GPIO_NUM_18
-#define LORA_MISO GPIO_NUM_19
-#define LORA_MOSI GPIO_NUM_23
-#define LORA_CS GPIO_NUM_5
-#define LORA_RST GPIO_NUM_14
-#define LORA_DIO0 GPIO_NUM_26
+#define LORA_SCK GPIO_NUM_14
+#define LORA_MISO GPIO_NUM_16
+#define LORA_MOSI GPIO_NUM_13
+#define LORA_CS GPIO_NUM_25
+#define LORA_RST GPIO_NUM_26
 
 /* Barramento I2C utilizado pelo display OLED SSD1306. */
-#define OLED_SDA GPIO_NUM_21
-#define OLED_SCL GPIO_NUM_22
+#define OLED_SDA GPIO_NUM_5
+#define OLED_SCL GPIO_NUM_4
 #define OLED_ADDRESS 0x3C
 
 #define LORA_FREQUENCY_HZ 915000000UL
@@ -292,14 +291,6 @@ static void hardware_init(void)
 		.intr_type = GPIO_INTR_DISABLE,
 	};
 	ESP_ERROR_CHECK(gpio_config(&lora_output));
-	gpio_config_t lora_input = {
-		.pin_bit_mask = 1ULL << LORA_DIO0,
-		.mode = GPIO_MODE_INPUT,
-		.pull_up_en = GPIO_PULLUP_DISABLE,
-		.pull_down_en = GPIO_PULLDOWN_DISABLE,
-		.intr_type = GPIO_INTR_DISABLE,
-	};
-	ESP_ERROR_CHECK(gpio_config(&lora_input));
 	gpio_set_level(LORA_CS, 1);
 
 	spi_bus_config_t spi_config = {
